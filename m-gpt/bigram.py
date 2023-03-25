@@ -11,7 +11,7 @@ learning_rate = 1e-2
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 #---------------------------------------
 
-print(device)
+print(f"Device {device}")
 torch.manual_seed(13337)
 
 #Post downloading the dataset
