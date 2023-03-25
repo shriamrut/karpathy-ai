@@ -96,4 +96,4 @@ for steps in range(max_iters):
 
 print(f"Final loss: {loss.item()}")
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=500)[0].tolist()))
+print(decode(m.generate(idx = context, max_new_tokens=500)[0].tolist()))
