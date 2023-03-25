@@ -11,6 +11,7 @@ learning_rate = 1e-2
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 #---------------------------------------
 
+print(device)
 torch.manual_seed(13337)
 
 #Post downloading the dataset
@@ -36,10 +37,25 @@ def get_batch(split):
     data = train_data if split == 'train' else test_data
     ix = torch.randint(len(data)-block_size, 
                        (batch_size,1))
-    xb = torch.stack([data[i:i+block_size] for i in ix])
-    yb = torch.stack([data[i+1:i+1+block_size] for i in ix])
-    return xb, yb
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+1+block_size] for i in ix])
+    x,y = x.to(device), y.to(device)
+    return x,y
 
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X,Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+    
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
@@ -65,7 +81,8 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat([idx, idx_next], dim=1) # (B, T+1)
         return idx
 
-m = BigramLanguageModel(vocab_size)
+model = BigramLanguageModel(vocab_size)
+m = model.to(device)
 
 optimizer = torch.optim.AdamW(m.parameters(), lr = learning_rate)
 for steps in range(max_iters):
@@ -78,5 +95,5 @@ for steps in range(max_iters):
         print(f"Loss at {steps}: {loss.item()}")
 
 print(f"Final loss: {loss.item()}")
-
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=500)[0].tolist()))
