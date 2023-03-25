@@ -9,6 +9,7 @@ max_iters = 3000
 eval_interval = 300
 learning_rate = 1e-2
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters = 200
 #---------------------------------------
 
 print(f"Device {device}")
@@ -85,15 +86,19 @@ model = BigramLanguageModel(vocab_size)
 m = model.to(device)
 
 optimizer = torch.optim.AdamW(m.parameters(), lr = learning_rate)
-for steps in range(max_iters):
+for iter in range(max_iters):
+    if iter % eval_interval == 0:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+    #sample batch
     xb, yb = get_batch('train')
+
+    #evaluate the loss
     logits, loss = m.forward(xb, yb)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-    if steps%500 == 0:
-        print(f"Loss at {steps}: {loss.item()}")
 
-print(f"Final loss: {loss.item()}")
+# generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(idx = context, max_new_tokens=500)[0].tolist()))
