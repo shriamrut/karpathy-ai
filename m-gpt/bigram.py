@@ -116,7 +116,7 @@ class Head(nn.Module):
         # compute attention score
         k = self.key(x)
         q = self.query(x)
-        wei = q @ k.transpose(-2, -1) * C**0.5 # (B,T,C) @ (B, C, T) = (B, T, T)
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B,T,C) @ (B, C, T) = (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf")) # (B, T, T)
         wei = F.softmax(wei, dim = -1) # (B, T, T)
         wei = self.dropout(wei)
@@ -166,10 +166,11 @@ class BigramLanguageModel(nn.Module):
 
 model = BigramLanguageModel()
 m = model.to(device)
+print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 optimizer = torch.optim.AdamW(m.parameters(), lr = learning_rate)
 for iter in range(max_iters):
-    if iter % eval_interval == 0:
+    if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
     #sample batch
