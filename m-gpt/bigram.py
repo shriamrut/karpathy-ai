@@ -125,7 +125,7 @@ class Head(nn.Module):
         out = wei @ v # (B, T, T) @ (B, T, T) = (B, T, T)
         return out
     
-class BigramLanguageModel(nn.Module):
+class DecoderTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
@@ -164,7 +164,7 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat([idx, idx_next], dim=1) # (B, T+1)
         return idx
 
-model = BigramLanguageModel()
+model = DecoderTransformer()
 m = model.to(device)
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
