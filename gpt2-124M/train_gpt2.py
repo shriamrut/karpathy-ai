@@ -39,7 +39,7 @@ class CausalSelfAttention(nn.Module):
             (B, T, n_h, hs) = (B, n_h, T, hs)
         '''
         # attention score 
-        att = (q @ k.tranpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         '''
             q = (B, n_h, T, hs)
             k = (B, n_h, T, hs)
@@ -70,6 +70,12 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate = 'tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -79,8 +85,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
     
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
@@ -145,7 +151,7 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}"
         pos = torch.arange(0, T, dtype = torch.long, device = idx.device)
-        pos_emb = self.transformer.wpe(pos_emb) # (T, n_embd)
+        pos_emb = self.transformer.wpe(pos) # (T, n_embd)
         tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
         x = pos_emb + tok_emb # (T, n_embd) + (B, T, n_embd) = (B, T, n_embd) + (B, T, n_embd) = (B, T, n_embd)
         for block in self.transformer.h:
@@ -157,7 +163,41 @@ class GPT(nn.Module):
 
 num_return_sequences = 5
 max_length = 30
-device = 'cuda' if torch.cuda.is_available else 'cpu'
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+    device = 'mps'
+
+print(f"Using device: {device}")
 model = GPT.from_pretrained('gpt2')
+#model = GPT(GPTConfig())
 model.eval()
 model = model.to(device)
+
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype = torch.long) # (, 8)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device)
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x)
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim = -1)
+        # only keep top 50, drops other probabilities to zero
+        top_k_probs, top_k_indices = torch.topk(probs, 50, dim = -1)
+        ix = torch.multinomial(top_k_probs, 1) # (B, 1)
+        xcol = torch.gather(top_k_indices, -1, ix) # (B, 1)
+        x = torch.cat((x, xcol), dim = 1)
+
+for i in range(num_return_sequences):
+    encoded_tokens = x[i, :].tolist()
+    decoded_tokens = enc.decode(encoded_tokens)
+    print("> ", decoded_tokens)
+
+
