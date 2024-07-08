@@ -3,7 +3,32 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import tiktoken
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1epoch = {len(self.tokens) / (self.B * self.T)} batches")
+
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x,y
+     
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -147,7 +172,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-    def forward(self, idx):
+    def forward(self, idx, targets = None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}"
         pos = torch.arange(0, T, dtype = torch.long, device = idx.device)
@@ -158,18 +183,43 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size) For each token, what is the next token thats coming in?
-        return logits        
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits , loss      
 # --------------------------------------------------------------------------------------------------------------------
 
-num_return_sequences = 5
-max_length = 30
 device = 'cpu'
 if torch.cuda.is_available():
     device = 'cuda'
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 
-print(f"Using device: {device}")
+train_loader = DataLoaderLite(B = 4, T = 32)  
+# get logits
+model = GPT(GPTConfig())
+model = model.to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x,y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step: {i+1}, loss: {loss.item()}")   
+ 
+'''
+random intialized network - -ln(1 / vocab_size) = -ln(1 / 50257) = 
+'''
+print(f"loss: {loss}")
+import sys; sys.exit(0)
+
+num_return_sequences = 5
+max_length = 30
+
+
 model = GPT.from_pretrained('gpt2')
 #model = GPT(GPTConfig())
 model.eval()
@@ -199,5 +249,3 @@ for i in range(num_return_sequences):
     encoded_tokens = x[i, :].tolist()
     decoded_tokens = enc.decode(encoded_tokens)
     print("> ", decoded_tokens)
-
-
