@@ -168,21 +168,6 @@ class GPT(nn.Module):
 
 
 # -------------------------------------------------------
-#model.eval()
-#device = 'cpu'
-import time
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-    device = 'cuda'
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = 'mps'
-    torch.mps.manual_seed(1337)
-
-#device = 'cpu' # override for testing
-print("Using device: ", device)
-model = GPT(GPTConfig()) #GPT.from_pretrained('gpt2')
-model = model.to(device)
 
 import tiktoken
 class DataLoaderLite:
@@ -210,7 +195,30 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
-train_loader = DataLoaderLite(B=4, T=32)            
+#model.eval()
+#device = 'cpu'
+import time
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+    device = 'cuda'
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = 'mps'
+    torch.mps.manual_seed(1337)
+else:
+    device = 'cpu'
+
+# enable tf-32, highest is available
+torch.set_float32_matmul_precision('high')
+print("Using device: ", device)
+model = GPT(GPTConfig()) #GPT.from_pretrained('gpt2')
+if device != 'mps':
+    # enable torch compile for cuda and cpu
+    # this will use triton for faster training
+    model = torch.compile(model) # triton failures update torch - pip install --upgrade torch
+model = model.to(device)
+
+train_loader = DataLoaderLite(B=8, T=1024)            
 model.train()
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -221,13 +229,19 @@ for i in range(50):
     x, y = train_loader.next_batch() # (B, T)
     x, y = x.to(device), y.to(device) # (B, T)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    #Use bfloat16 incase CUDA support it otherwise use float32 (trying float 16, even though its said to use gradient scalers)
+    if device == 'cuda':
+        with torch.autocast(device_type=device, dtype=torch.float16):
+            logits, loss = model(x, y)
+    else:
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     torch.mps.synchronize() if device == 'mps' else torch.cuda.synchronize() if device == 'cuda' else None
     t1 = time.time()
     dt = (t1 - t0) * 1000 # in milliseconds
-    print(f"Step {i+1}, Loss: {loss.item()}, dt: {dt:.2f}ms")
+    token_per_sec = train_loader.B * train_loader.T / (t1 - t0)
+    print(f"Step {i+1}, Loss: {loss.item()}, dt: {dt:.2f}ms, tokens per second: {token_per_sec:.2f} tokens/sec")
 
 import sys; sys.exit(0)
 #model = GPT.from_pretrained('gpt2').to(device)
@@ -262,12 +276,3 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print("> ", decoded)
-
-
-
-
-
-
-
-
-
