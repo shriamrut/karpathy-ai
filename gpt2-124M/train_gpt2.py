@@ -35,10 +35,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1) # (B, nh, T, T)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1) # (B, nh, T, T)
+        #y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # wrap it back together
         y = self.c_proj(y)
         return y  # (B, T, C)
@@ -211,7 +212,8 @@ else:
 # enable tf-32, highest is available
 torch.set_float32_matmul_precision('high')
 print("Using device: ", device)
-model = GPT(GPTConfig()) #GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig(vocab_size=50304)) # Override to have nice numbers from 50257 to 50304.
+#Running pretrained models -  GPT.from_pretrained('gpt2')
 if device != 'mps':
     # enable torch compile for cuda and cpu
     # this will use triton for faster training
@@ -221,7 +223,7 @@ model = model.to(device)
 train_loader = DataLoaderLite(B=8, T=1024)            
 model.train()
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas = (0.9, 0.95), eps = 1e-8)
 print("number of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
 print("number of trainable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
 for i in range(50):
@@ -236,12 +238,13 @@ for i in range(50):
     else:
         logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # clip gradients - best explained here https://stackoverflow.com/questions/76838254/an-example-of-how-pytorch-clip-grad-norm-works
     optimizer.step()
     torch.mps.synchronize() if device == 'mps' else torch.cuda.synchronize() if device == 'cuda' else None
     t1 = time.time()
     dt = (t1 - t0) * 1000 # in milliseconds
     token_per_sec = train_loader.B * train_loader.T / (t1 - t0)
-    print(f"Step {i+1}, Loss: {loss.item()}, dt: {dt:.2f}ms, tokens per second: {token_per_sec:.2f} tokens/sec")
+    print(f"Step {i+1}, Loss: {loss.item()}, dt: {dt:.2f}ms, tokens per second: {token_per_sec:.2f} tokens/sec, norm: {norm: .4f}")
 
 import sys; sys.exit(0)
 #model = GPT.from_pretrained('gpt2').to(device)
