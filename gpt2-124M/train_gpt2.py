@@ -11,7 +11,7 @@ class GPTConfig:
     vocab_size: int = 50257 # number of tokens : 50k BPE + 256 byte tokens + 1 EOF
     n_layer: int = 12 # number of layers
     n_head: int = 6 # number of heads
-    n_embd: int = 384 # embedding dimension
+    n_embd: int = 768 # embedding dimension
 
 
 class CausalSelfAttention(nn.Module):
@@ -114,7 +114,7 @@ class GPT(nn.Module):
         assert T <= self.config.block_size, "Cannot forward sequence of length %d, block size is only %d" % (T, self.config.block_size)
 
         # forward the GPT model
-        pos = torch.arange(T, dtype = torch.long, device=idx.device)
+        pos = torch.arange(0, T, dtype = torch.long, device=idx.device)
         pos_emb = self.transformer.wpe(pos) # (T, n_embd)
         tok_emb = self.transformer.wte(idx) # (B, T, n_embd)
         x = tok_emb + pos_emb # (B, T, n_embd)
@@ -245,46 +245,65 @@ def get_lr(it):
 #model.eval()
 #device = 'cpu'
 import time
-torch.manual_seed(1337)
+device = 'cpu'
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
     device = 'cuda'
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = 'mps'
     torch.mps.manual_seed(1337)
-else:
-    device = 'cpu'
+torch.manual_seed(1337)
+
+total_batch_size = 524288 # 2 ^ 19 , ~0.5M
+B = 4 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "total batch size must be divisible by B * T"
+grad_accumulation_steps = total_batch_size // (B * T) 
+print("total desired batch_size: ", total_batch_size)
+print("==> calculated grad_accumulation_steps: ", grad_accumulation_steps)
+
+train_loader = DataLoaderLite(B=B, T=T) 
 
 # enable tf-32, highest is available
 torch.set_float32_matmul_precision('high')
 print("Using device: ", device)
 model = GPT(GPTConfig(vocab_size=50304)) # Override to have nice numbers from 50257 to 50304.
 #Running pretrained models -  GPT.from_pretrained('gpt2')
+
 if device != 'mps':
     # enable torch compile for cuda and cpu
     # this will use triton for faster training
+    print("Compiling model with torch.compile()")
     model = torch.compile(model) # triton failures update torch - pip install --upgrade torch
-model = model.to(device)
-
-train_loader = DataLoaderLite(B=8, T=1024)            
+model = model.to(device) #TODO move it up and check?
+           
 model.train()
 
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas = (0.9, 0.95), eps = 1e-8)
-optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = min_lr, device = device)
+optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = max_lr, device = device)
 print("number of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
 print("number of trainable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch() # (B, T)
-    x, y = x.to(device), y.to(device) # (B, T)
     optimizer.zero_grad()
-    #Use bfloat16 incase CUDA support it otherwise use float32 (trying float 16, even though its said to use gradient scalers)
-    if device == 'cuda':
-        with torch.autocast(device_type=device, dtype=torch.float16):
+    loss_accum = 0.0
+    for micro_step in range(grad_accumulation_steps):
+        x, y = train_loader.next_batch() # (B, T)
+        x, y = x.to(device), y.to(device) # (B, T)
+        #Use bfloat16 incase CUDA support it otherwise use float32 (trying float 16, even though its said to use gradient scalers)
+        if device == 'cuda':
+            with torch.autocast(device_type=device, dtype=torch.float16):
+                logits, loss = model(x, y)
+        else:
             logits, loss = model(x, y)
-    else:
-        logits, loss = model(x, y)
-    loss.backward()
+        # scale the loss for gradient accumulation (V.IMPORTANT while using gradient accumulation)
+        # because the gradient just add on each successive backward
+        # addition of gradient corresponds to SUM in the objective, but
+        # instead of SUM we mean mean. Scale the loss here so it comes out right
+        loss = loss / grad_accumulation_steps 
+        loss_accum += loss.detach()
+        loss.backward()
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # clip gradients - inplace
     lr = get_lr(step)
     # override the learning rate
@@ -293,9 +312,10 @@ for step in range(max_steps):
     optimizer.step()
     torch.mps.synchronize() if device == 'mps' else torch.cuda.synchronize() if device == 'cuda' else None
     t1 = time.time()
-    dt = (t1 - t0) * 1000 # in milliseconds
-    token_per_sec = train_loader.B * train_loader.T / (t1 - t0)
-    print(f"Step {step} | loss: {loss.item(): .6f} | lr: {lr:.4e}  | norm: {norm: .4f} | dt: {dt:.2f}ms | tokens per second: {token_per_sec:.2f} tokens/sec")
+    dt = (t1 - t0)
+    token_processed = train_loader.B * train_loader.T * grad_accumulation_steps 
+    token_per_sec = token_processed / dt
+    print(f"Step {step} | loss: {loss_accum.item(): .6f} | lr: {lr:.4e}  | norm: {norm: .4f} | dt: {dt * 1000:.2f}ms | tokens per second: {token_per_sec:.2f} tokens/sec")
 
 import sys; sys.exit(0)
 #model = GPT.from_pretrained('gpt2').to(device)
