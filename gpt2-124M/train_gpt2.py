@@ -4,6 +4,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
+import numpy as np
+
 
 @dataclass
 class GPTConfig:
@@ -198,23 +200,32 @@ class GPT(nn.Module):
 
 
 # -------------------------------------------------------
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 import tiktoken
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {'train', 'val'}
 
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens, dtype=torch.long) # (N, )
+        data_root = '/kaggle/working/edu_fineweb10B' # will only have 6B due to storage constraints
+        shards = os.listdir(data_root)
+        shards = [os.path.join(data_root,s) for s in shards if split in s]
+        shards = sorted(shards) # sort the shards
+        assert len(shards) > 0, "No shards found for split %s in %s" % (split, data_root)
         if master_process:
-            print("loaded %d tokens from input.txt" % len(self.tokens))
+            print(f"found {len(shards)} shards for split {split} in {data_root}")
+        self.shards = shards
 
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
         # state
         self.current_position = self.B * self.T * self.process_rank # start at the beginning of the data for this process
     
@@ -225,15 +236,16 @@ class DataLoaderLite:
         y = buf[1:].view(B, T)
         self.current_position += (B * T * self.num_processes) # move the position forward by B * T * num_processes
         if self.current_position + B * T * self.num_processes >= len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+            self.current_shard = (self.current_shard + 1) % len(self.shards) # move to the next shard
+            self.current_position = B * T * self.process_rank
         return x, y
 
 
 # Implementing a learning rate decay
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 500
+max_steps = 11444 # 6e9 // 2 ** 19 (only 6B due to storage constraints)
 def get_lr(it):
     #1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -292,7 +304,8 @@ else:
         device = 'mps'
         torch.mps.manual_seed(1337)
     torch.manual_seed(1337)
-    print(f"Using device: {device}")
+    if master_process:
+        print(f"Using device: {device}")
 
 total_batch_size = 524288 # 2 ^ 19 , ~0.5M
 B = 4 # micro batch size per GPU / CPU
@@ -304,7 +317,7 @@ if master_process:
     print("==> calculated grad_accumulation_steps: ", grad_accumulation_steps)
 
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank = ddp_rank, num_processes = ddp_world_size) 
+train_loader = DataLoaderLite(B=B, T=T, process_rank = ddp_rank, num_processes = ddp_world_size, split = "train") 
 
 # enable tf-32, highest is available
 torch.set_float32_matmul_precision('high')
@@ -316,7 +329,8 @@ model = model.to(device)
 if device != 'mps':
     # enable torch compile for cuda and cpu
     # this will use triton for faster training
-    print("Compiling model with torch.compile()")
+    if master_process:
+        print("Compiling model with torch.compile()")
     model = torch.compile(model) # triton failures update torch - pip install --upgrade torch
 
 if ddp:
@@ -327,8 +341,9 @@ model.train()
 
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas = (0.9, 0.95), eps = 1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = max_lr, device = device)
-print("number of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
-print("number of trainable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
+if master_process:
+    print("number of parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
+    print("number of trainable parameters: ", sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6, "M")
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
@@ -403,3 +418,4 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print("> ", decoded)
+#https://youtu.be/l8pRSuU81PU?t=11657
